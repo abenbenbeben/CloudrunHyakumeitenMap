@@ -14,6 +14,7 @@ app = Flask(__name__)
 API_KEY = os.environ["PLACES_API_KEY"]
 
 SESSION = requests.Session()
+
 FIRESTORE_PROJECT_ID = os.environ.get("FIRESTORE_PROJECT_ID")
 FIRESTORE_DATABASE_ID = os.environ.get("FIRESTORE_DATABASE_ID", "(default)")
 
@@ -25,24 +26,27 @@ DB = firestore.Client(
 # -----------------------------
 # 設定
 # -----------------------------
-CACHE_TTL_SEC = int(os.environ.get("PHOTO_URI_CACHE_TTL_SEC", "7200"))  # 120分
+# レスポンスのブラウザ/CDN向けキャッシュ時間
+RESPONSE_MAX_AGE_SEC = int(os.environ.get("PHOTO_RESPONSE_MAX_AGE_SEC", "3600"))  # 1時間
+
+# ローカルメモリキャッシュ
+LOCAL_OK_TTL_SEC = int(os.environ.get("PHOTO_LOCAL_OK_TTL_SEC", "7200"))  # 2時間
+LOCAL_NEG_TTL_SEC = int(os.environ.get("PHOTO_LOCAL_NEG_TTL_SEC", "60"))  # 1分
 MAX_CACHE_SIZE = int(os.environ.get("PHOTO_URI_CACHE_MAX", "5000"))
+MAX_NEG_CACHE_SIZE = int(os.environ.get("PHOTO_NEGATIVE_CACHE_MAX", "1000"))
 
-NEGATIVE_CACHE_TTL_SEC = int(
-    os.environ.get("PHOTO_NEGATIVE_CACHE_TTL_SEC", "60")
-)  # 失敗は短期だけキャッシュ
-MAX_NEGATIVE_CACHE_SIZE = int(
-    os.environ.get("PHOTO_NEGATIVE_CACHE_MAX", "1000")
-)
+# Firestore共有キャッシュ
+FIRESTORE_OK_TTL_SEC = int(os.environ.get("PHOTO_FIRESTORE_OK_TTL_SEC", "86400"))  # 1日
+FIRESTORE_NEG_TTL_SEC = int(os.environ.get("PHOTO_FIRESTORE_NEG_TTL_SEC", "300"))  # 5分
 
-INFLIGHT_WAIT_SEC = int(
-    os.environ.get("PHOTO_INFLIGHT_WAIT_SEC", "15")
-)  # 同一インスタンス内の同時MISS待機時間
+# Firestore I/O timeout
+FIRESTORE_GET_TIMEOUT_SEC = float(os.environ.get("PHOTO_FIRESTORE_GET_TIMEOUT_SEC", "1.5"))
+FIRESTORE_SET_TIMEOUT_SEC = float(os.environ.get("PHOTO_FIRESTORE_SET_TIMEOUT_SEC", "2.0"))
 
-PHOTO_CACHE_COLLECTION = os.environ.get(
-    "PHOTO_CACHE_COLLECTION",
-    "placePhotoCache",
-)
+INFLIGHT_WAIT_SEC = int(os.environ.get("PHOTO_INFLIGHT_WAIT_SEC", "15"))
+
+PHOTO_CACHE_COLLECTION = os.environ.get("PHOTO_CACHE_COLLECTION", "placePhotoCache")
+PHOTO_CACHE_COL = DB.collection(PHOTO_CACHE_COLLECTION)
 
 # -----------------------------
 # ローカルキャッシュ類
@@ -111,7 +115,7 @@ def build_doc_id(key: str) -> str:
 
 def build_redirect_response(photo_uri: str, cache_status: str):
     resp = make_response(redirect(photo_uri, code=302))
-    resp.headers["Cache-Control"] = f"public, max-age={CACHE_TTL_SEC}"
+    resp.headers["Cache-Control"] = f"public, max-age={RESPONSE_MAX_AGE_SEC}"
     resp.headers["X-Photo-Cache"] = cache_status
     return resp
 
@@ -137,7 +141,6 @@ def cache_get(key: str):
             _CACHE.pop(key, None)
             return None
 
-        # LRUっぽく最後尾へ
         _CACHE.move_to_end(key)
         return uri
 
@@ -145,7 +148,7 @@ def cache_get(key: str):
 def cache_set(key: str, uri: str):
     now = time.time()
     with _LOCK:
-        _CACHE[key] = (uri, now + CACHE_TTL_SEC)
+        _CACHE[key] = (uri, now + LOCAL_OK_TTL_SEC)
         _CACHE.move_to_end(key)
 
         while len(_CACHE) > MAX_CACHE_SIZE:
@@ -174,10 +177,10 @@ def neg_cache_get(key: str):
 def neg_cache_set(key: str, status_code: int, message: str):
     now = time.time()
     with _LOCK:
-        _NEG_CACHE[key] = (status_code, message, now + NEGATIVE_CACHE_TTL_SEC)
+        _NEG_CACHE[key] = (status_code, message, now + LOCAL_NEG_TTL_SEC)
         _NEG_CACHE.move_to_end(key)
 
-        while len(_NEG_CACHE) > MAX_NEGATIVE_CACHE_SIZE:
+        while len(_NEG_CACHE) > MAX_NEG_CACHE_SIZE:
             _NEG_CACHE.popitem(last=False)
 
 
@@ -190,8 +193,7 @@ def neg_cache_clear(key: str):
 # Firestore 共有キャッシュ
 # -----------------------------
 def fs_doc_ref(key: str):
-    doc_id = build_doc_id(key)
-    return DB.collection(PHOTO_CACHE_COLLECTION).document(doc_id)
+    return PHOTO_CACHE_COL.document(build_doc_id(key))
 
 
 def _normalize_dt(dt):
@@ -208,14 +210,17 @@ def fs_cache_get(key: str):
       ("ok", photo_uri) or ("neg", (status_code, message)) or None
     """
     try:
-        snap = fs_doc_ref(key).get()
+        snap = fs_doc_ref(key).get(
+            field_paths=["kind", "photoUri", "statusCode", "message", "expiresAt"],
+            timeout=FIRESTORE_GET_TIMEOUT_SEC,
+        )
+
         if not snap.exists:
             return None
 
         data = snap.to_dict() or {}
         expires_at = _normalize_dt(data.get("expiresAt"))
 
-        # expiresAt がない / 期限切れなら使わない
         if not expires_at or expires_at <= utc_now():
             return None
 
@@ -238,41 +243,39 @@ def fs_cache_get(key: str):
         return None
 
 
-def fs_cache_set_ok(key: str, ref: str | None, name: str | None, maxw: str, photo_uri: str):
+def fs_cache_set_ok(key: str, photo_uri: str):
     try:
+        expires_at = utc_now() + timedelta(seconds=FIRESTORE_OK_TTL_SEC)
+
+        # Firestore TTL policy は gcAt に対して設定する
         fs_doc_ref(key).set(
             {
-                "cacheKey": key,
                 "kind": "ok",
-                "ref": ref,
-                "name": name,
-                "maxw": maxw,
                 "photoUri": photo_uri,
-                "statusCode": None,
-                "message": None,
-                "expiresAt": utc_now() + timedelta(seconds=CACHE_TTL_SEC),
+                "expiresAt": expires_at,  # アプリ側の有効期限判定
+                "gcAt": expires_at,       # Firestore TTL policy 用
                 "updatedAt": firestore.SERVER_TIMESTAMP,
-            }
+            },
+            timeout=FIRESTORE_SET_TIMEOUT_SEC,
         )
     except Exception:
         app.logger.exception("firestore cache set ok failed")
 
 
-def fs_cache_set_neg(key: str, ref: str | None, name: str | None, maxw: str, status_code: int, message: str):
+def fs_cache_set_neg(key: str, status_code: int, message: str):
     try:
+        expires_at = utc_now() + timedelta(seconds=FIRESTORE_NEG_TTL_SEC)
+
         fs_doc_ref(key).set(
             {
-                "cacheKey": key,
                 "kind": "neg",
-                "ref": ref,
-                "name": name,
-                "maxw": maxw,
-                "photoUri": None,
                 "statusCode": int(status_code),
                 "message": str(message)[:500],
-                "expiresAt": utc_now() + timedelta(seconds=NEGATIVE_CACHE_TTL_SEC),
+                "expiresAt": expires_at,
+                "gcAt": expires_at,
                 "updatedAt": firestore.SERVER_TIMESTAMP,
-            }
+            },
+            timeout=FIRESTORE_SET_TIMEOUT_SEC,
         )
     except Exception:
         app.logger.exception("firestore cache set neg failed")
@@ -411,7 +414,6 @@ def place_photo():
     if not is_owner:
         finished = inflight_ev.wait(timeout=INFLIGHT_WAIT_SEC)
 
-        # owner 完了後、再参照
         cached = cache_get(key)
         if cached:
             return build_redirect_response(cached, "WAIT_HIT")
@@ -437,7 +439,6 @@ def place_photo():
 
     # 5) owner だけが Places を叩く
     try:
-        # 取得前に再チェック
         cached = cache_get(key)
         if cached:
             return build_redirect_response(cached, "RACE_HIT")
@@ -458,17 +459,15 @@ def place_photo():
 
         photo_uri = fetch_photo_uri(ref=ref, name=name, maxw=maxw)
 
-        # 成功したらローカル + Firestore に保存
         cache_set(key, photo_uri)
         neg_cache_clear(key)
-        fs_cache_set_ok(key, ref, name, maxw, photo_uri)
+        fs_cache_set_ok(key, photo_uri)
 
         return build_redirect_response(photo_uri, "MISS")
 
     except UpstreamPhotoError as e:
-        # 失敗したらローカル + Firestore に短期保存
         neg_cache_set(key, e.status_code, e.message)
-        fs_cache_set_neg(key, ref, name, maxw, e.status_code, e.message)
+        fs_cache_set_neg(key, e.status_code, e.message)
         return build_error_response(e.status_code, e.message, "MISS_NEG")
 
     finally:
