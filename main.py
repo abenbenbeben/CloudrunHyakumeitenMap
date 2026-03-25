@@ -36,7 +36,7 @@ MAX_CACHE_SIZE = int(os.environ.get("PHOTO_URI_CACHE_MAX", "5000"))
 MAX_NEG_CACHE_SIZE = int(os.environ.get("PHOTO_NEGATIVE_CACHE_MAX", "1000"))
 
 # Firestore共有キャッシュ
-FIRESTORE_OK_TTL_SEC = int(os.environ.get("PHOTO_FIRESTORE_OK_TTL_SEC", "86400"))  # 1日
+FIRESTORE_OK_TTL_SEC = int(os.environ.get("PHOTO_FIRESTORE_OK_TTL_SEC", "604800"))  # 7日
 FIRESTORE_NEG_TTL_SEC = int(os.environ.get("PHOTO_FIRESTORE_NEG_TTL_SEC", "300"))  # 5分
 
 # Firestore I/O timeout
