@@ -125,6 +125,24 @@ def build_error_response(status_code: int, message: str, cache_status: str):
     resp.headers["X-Photo-Cache"] = cache_status
     return resp
 
+def parse_bool_arg(name: str) -> bool:
+    raw = str(request.args.get(name, "")).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def get_existing_ok_uri(key: str):
+    cached = cache_get(key)
+    if cached:
+        return cached
+
+    shared = fs_cache_get(key)
+    if shared and shared[0] == "ok":
+        photo_uri = shared[1]
+        cache_set(key, photo_uri)
+        neg_cache_clear(key)
+        return photo_uri
+
+    return None
 
 # -----------------------------
 # ローカル正常系キャッシュ
@@ -381,34 +399,36 @@ def place_photo():
     maxw = normalize_maxw(request.args.get("maxw", "800"))
     ref = request.args.get("ref")
     name = request.args.get("name")
+    refresh = parse_bool_arg("refresh")
 
     if not ref and not name:
         abort(400, "missing ref or name")
 
     key = build_cache_key(ref, name, maxw)
 
-    # 1) ローカル正常系キャッシュ
-    cached = cache_get(key)
-    if cached:
-        return build_redirect_response(cached, "HIT")
+    # refresh時は既存OKキャッシュだけ退避しておく
+    fallback_ok_uri = get_existing_ok_uri(key) if refresh else None
 
-    # 2) ローカル失敗系キャッシュ
-    neg = neg_cache_get(key)
-    if neg:
-        status_code, message = neg
-        return build_error_response(status_code, message, "NEG_HIT")
+    # 通常時だけ cache hit を返す
+    if not refresh:
+        cached = cache_get(key)
+        if cached:
+            return build_redirect_response(cached, "HIT")
 
-    # 3) Firestore共有キャッシュ
-    shared = hydrate_from_firestore(key)
-    if shared:
-        kind, payload = shared
-        if kind == "ok":
-            return build_redirect_response(payload, "FIRESTORE_HIT")
+        neg = neg_cache_get(key)
+        if neg:
+            status_code, message = neg
+            return build_error_response(status_code, message, "NEG_HIT")
 
-        status_code, message = payload
-        return build_error_response(status_code, message, "FIRESTORE_NEG_HIT")
+        shared = hydrate_from_firestore(key)
+        if shared:
+            kind, payload = shared
+            if kind == "ok":
+                return build_redirect_response(payload, "FIRESTORE_HIT")
 
-    # 4) 同一インスタンス内 single-flight
+            status_code, message = payload
+            return build_error_response(status_code, message, "FIRESTORE_NEG_HIT")
+
     inflight_ev, is_owner = inflight_get_or_create(key)
 
     if not is_owner:
@@ -416,46 +436,63 @@ def place_photo():
 
         cached = cache_get(key)
         if cached:
-            return build_redirect_response(cached, "WAIT_HIT")
+            return build_redirect_response(
+                cached,
+                "WAIT_REFRESH_HIT" if refresh else "WAIT_HIT",
+            )
 
         neg = neg_cache_get(key)
         if neg:
             status_code, message = neg
-            return build_error_response(status_code, message, "WAIT_NEG_HIT")
+            return build_error_response(
+                status_code,
+                message,
+                "WAIT_REFRESH_NEG_HIT" if refresh else "WAIT_NEG_HIT",
+            )
 
         shared = hydrate_from_firestore(key)
         if shared:
             kind, payload = shared
             if kind == "ok":
-                return build_redirect_response(payload, "WAIT_FIRESTORE_HIT")
+                return build_redirect_response(
+                    payload,
+                    "WAIT_REFRESH_FIRESTORE_HIT" if refresh else "WAIT_FIRESTORE_HIT",
+                )
 
             status_code, message = payload
-            return build_error_response(status_code, message, "WAIT_FIRESTORE_NEG_HIT")
+            return build_error_response(
+                status_code,
+                message,
+                "WAIT_REFRESH_FIRESTORE_NEG_HIT" if refresh else "WAIT_FIRESTORE_NEG_HIT",
+            )
+
+        if refresh and fallback_ok_uri:
+            return build_redirect_response(fallback_ok_uri, "WAIT_REFRESH_FALLBACK_HIT")
 
         if not finished:
             return build_error_response(504, "photo fetch in progress timeout", "WAIT_TIMEOUT")
 
         return build_error_response(502, "photo fetch completed but no cache populated", "WAIT_EMPTY")
 
-    # 5) owner だけが Places を叩く
     try:
-        cached = cache_get(key)
-        if cached:
-            return build_redirect_response(cached, "RACE_HIT")
+        if not refresh:
+            cached = cache_get(key)
+            if cached:
+                return build_redirect_response(cached, "RACE_HIT")
 
-        neg = neg_cache_get(key)
-        if neg:
-            status_code, message = neg
-            return build_error_response(status_code, message, "RACE_NEG_HIT")
+            neg = neg_cache_get(key)
+            if neg:
+                status_code, message = neg
+                return build_error_response(status_code, message, "RACE_NEG_HIT")
 
-        shared = hydrate_from_firestore(key)
-        if shared:
-            kind, payload = shared
-            if kind == "ok":
-                return build_redirect_response(payload, "RACE_FIRESTORE_HIT")
+            shared = hydrate_from_firestore(key)
+            if shared:
+                kind, payload = shared
+                if kind == "ok":
+                    return build_redirect_response(payload, "RACE_FIRESTORE_HIT")
 
-            status_code, message = payload
-            return build_error_response(status_code, message, "RACE_FIRESTORE_NEG_HIT")
+                status_code, message = payload
+                return build_error_response(status_code, message, "RACE_FIRESTORE_NEG_HIT")
 
         photo_uri = fetch_photo_uri(ref=ref, name=name, maxw=maxw)
 
@@ -463,12 +500,21 @@ def place_photo():
         neg_cache_clear(key)
         fs_cache_set_ok(key, photo_uri)
 
-        return build_redirect_response(photo_uri, "MISS")
+        return build_redirect_response(photo_uri, "REFRESH_MISS" if refresh else "MISS")
 
     except UpstreamPhotoError as e:
+        if refresh and fallback_ok_uri:
+            # 既存の正常キャッシュは壊さず、それを返す
+            return build_redirect_response(fallback_ok_uri, "REFRESH_FALLBACK_HIT")
+
         neg_cache_set(key, e.status_code, e.message)
         fs_cache_set_neg(key, e.status_code, e.message)
-        return build_error_response(e.status_code, e.message, "MISS_NEG")
+
+        return build_error_response(
+            e.status_code,
+            e.message,
+            "REFRESH_MISS_NEG" if refresh else "MISS_NEG",
+        )
 
     finally:
         inflight_release(key)
