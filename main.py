@@ -37,7 +37,6 @@ MAX_NEG_CACHE_SIZE = int(os.environ.get("PHOTO_NEGATIVE_CACHE_MAX", "1000"))
 
 # Firestore共有キャッシュ
 FIRESTORE_OK_TTL_SEC = int(os.environ.get("PHOTO_FIRESTORE_OK_TTL_SEC", "864000"))  # 10日 CloudRun側の変数を編集すること
-FIRESTORE_NEG_TTL_SEC = int(os.environ.get("PHOTO_FIRESTORE_NEG_TTL_SEC", "300"))  # 5分
 
 # Firestore I/O timeout
 FIRESTORE_GET_TIMEOUT_SEC = float(os.environ.get("PHOTO_FIRESTORE_GET_TIMEOUT_SEC", "1.5"))
@@ -221,15 +220,15 @@ def _normalize_dt(dt):
         return dt.replace(tzinfo=timezone.utc)
     return dt
 
-
 def fs_cache_get(key: str):
     """
     戻り値:
-      ("ok", photo_uri) or ("neg", (status_code, message)) or None
+      ("ok", photo_uri) or None
+    ※ Firestore では正常系のみ扱う
     """
     try:
         snap = fs_doc_ref(key).get(
-            field_paths=["kind", "photoUri", "statusCode", "message", "expiresAt"],
+            field_paths=["kind", "photoUri", "expiresAt"],
             timeout=FIRESTORE_GET_TIMEOUT_SEC,
         )
 
@@ -247,13 +246,8 @@ def fs_cache_get(key: str):
             photo_uri = data.get("photoUri")
             if photo_uri:
                 return ("ok", photo_uri)
-            return None
 
-        if kind == "neg":
-            status_code = int(data.get("statusCode", 502))
-            message = str(data.get("message", "upstream error"))
-            return ("neg", (status_code, message))
-
+        # neg は Firestore 上では無視
         return None
 
     except Exception:
@@ -278,25 +272,6 @@ def fs_cache_set_ok(key: str, photo_uri: str):
         )
     except Exception:
         app.logger.exception("firestore cache set ok failed")
-
-
-def fs_cache_set_neg(key: str, status_code: int, message: str):
-    try:
-        expires_at = utc_now() + timedelta(seconds=FIRESTORE_NEG_TTL_SEC)
-
-        fs_doc_ref(key).set(
-            {
-                "kind": "neg",
-                "statusCode": int(status_code),
-                "message": str(message)[:500],
-                "expiresAt": expires_at,
-                "gcAt": expires_at,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            },
-            timeout=FIRESTORE_SET_TIMEOUT_SEC,
-        )
-    except Exception:
-        app.logger.exception("firestore cache set neg failed")
 
 
 # -----------------------------
@@ -374,7 +349,7 @@ def hydrate_from_firestore(key: str):
     """
     Firestoreの共有キャッシュから取り出して、ローカルキャッシュにも載せる
     戻り値:
-      ("ok", photo_uri) / ("neg", (status_code, message)) / None
+      ("ok", photo_uri) / None
     """
     hit = fs_cache_get(key)
     if not hit:
@@ -386,9 +361,7 @@ def hydrate_from_firestore(key: str):
         neg_cache_clear(key)
         return ("ok", payload)
 
-    status_code, message = payload
-    neg_cache_set(key, status_code, message)
-    return ("neg", (status_code, message))
+    return None
 
 
 # -----------------------------
@@ -501,14 +474,14 @@ def place_photo():
         fs_cache_set_ok(key, photo_uri)
 
         return build_redirect_response(photo_uri, "REFRESH_MISS" if refresh else "MISS")
-
+    # except UpstreamPhotoError の箇所
     except UpstreamPhotoError as e:
         if refresh and fallback_ok_uri:
             # 既存の正常キャッシュは壊さず、それを返す
             return build_redirect_response(fallback_ok_uri, "REFRESH_FALLBACK_HIT")
 
         neg_cache_set(key, e.status_code, e.message)
-        fs_cache_set_neg(key, e.status_code, e.message)
+        # fs_cache_set_neg(key, e.status_code, e.message)  ← 削除
 
         return build_error_response(
             e.status_code,
